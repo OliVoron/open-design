@@ -14,6 +14,19 @@ import type { RuntimeAgentDef } from '../types.js';
 
 const ANTIGRAVITY_SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions';
 
+// `-p` requires a non-empty value, but the composed OD prompt cannot be that
+// value: on Windows it routinely exceeds CreateProcess's 32_767-char command
+// line and the spawn dies with `ENAMETOOLONG` before agy starts (OPEND-3495).
+// agy reads a piped stdin in print mode and treats it as the prompt body
+// alongside the `-p` value (verified on agy 1.3.1: a 52 KB stdin prompt whose
+// last line held the real instruction was followed, while the log reported
+// `promptLength=42` for the flag value). So argv carries only this short,
+// prompt-independent pointer and the daemon streams the real prompt on stdin.
+// Note `-p -` is NOT a stdin sentinel — agy treats it as the literal prompt
+// "-" (#7161).
+export const ANTIGRAVITY_STDIN_PROMPT_POINTER =
+  'Follow the instructions provided on stdin.';
+
 // `agy` v1.0.3 still has no `--model` flag (upstream issue #35), but the
 // TUI's Switch-Model picker writes the choice to its settings.json, and
 // every `agy -p` invocation re-reads that file on startup — verified by
@@ -210,7 +223,7 @@ export const antigravityAgentDef = {
   // composed in server.ts gives a second line of defense for weak
   // plain-stream models like Gemini 3.5 Flash.
   buildArgs: (
-    prompt,
+    _prompt,
     _imagePaths,
     _extra = [],
     options = {},
@@ -222,12 +235,9 @@ export const antigravityAgentDef = {
         runtimeContext.antigravitySettingsPath,
       );
     }
-    // Print mode via `-p <prompt>`. Older OD used `agy -p -` and wrote the
-    // prompt on stdin, but current agy (reproduced on 1.1.13) treats `-`
-    // as the literal prompt string and ignores stdin — the model only
-    // ever sees a single dash (#7161). Passing the real prompt as the
-    // `-p` argument matches the verified working CLI form
-    // (`agy -p "say hello"`).
+    // Print mode via `-p <pointer>` with the real prompt on stdin — see
+    // ANTIGRAVITY_STDIN_PROMPT_POINTER for why the prompt must stay out of
+    // argv.
     const args: string[] = [];
     // Always opt into `--log-file` when the daemon supplied a path so
     // it can post-exit grep for the actual upstream failure shape
@@ -245,10 +255,10 @@ export const antigravityAgentDef = {
     if (agentCapabilities.get('antigravity')?.skipPermissions) {
       args.push(ANTIGRAVITY_SKIP_PERMISSIONS_FLAG);
     }
-    args.push('-p', prompt);
+    args.push('-p', ANTIGRAVITY_STDIN_PROMPT_POINTER);
     return args;
   },
-  promptViaStdin: false,
+  promptViaStdin: true,
   streamFormat: 'plain',
   installUrl: 'https://antigravity.google/cli',
   docsUrl: 'https://antigravity.google/docs/cli-overview',

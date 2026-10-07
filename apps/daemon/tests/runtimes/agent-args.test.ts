@@ -3,7 +3,10 @@ import { test } from 'vitest';
 import {
   AGENT_DEFS, aider, antigravity, assert, claude, codex, copilot, cursorAgent, deepseek, devin, detectAgents, grokBuild, join, kilo, kimi, kiro, mkdtempSync, opencode, pi, qoder, qwen, rmSync, spawnEnvForAgent, tmpdir, vibe, writeFileSync, chmodSync,
 } from './helpers/test-helpers.js';
-import { writeAntigravityModelSelection } from '../../src/runtimes/defs/antigravity.js';
+import {
+  ANTIGRAVITY_STDIN_PROMPT_POINTER,
+  writeAntigravityModelSelection,
+} from '../../src/runtimes/defs/antigravity.js';
 import { parseOpenCodeModels } from '../../src/runtimes/defs/opencode.js';
 import { agentCapabilities } from '../../src/runtimes/capabilities.js';
 import {
@@ -647,19 +650,17 @@ test('qwen args check promptViaStdin, base args, model args and exclude `-` sent
   assert.equal(withModel.includes('-'), false);
 });
 
-// `agy` exposes `-p` (print mode, alias for `--print`) plus `-` as
-// the stdin sentinel — confirmed against `agy --help` on v1.0.3, where
-// `Available subcommands` is `changelog / help / install / plugin /
-// update` (no `chat`). Current agy treats `agy -p -` as a literal
-// prompt of "-" (stdin is ignored) — see #7161. OD therefore passes
-// the real prompt as the `-p` argument.
-test('antigravity passes prompt via -p argument (print mode)', () => {
+// `agy -p -` is NOT a stdin sentinel: agy treats it as the literal prompt
+// "-" (#7161). `-p` therefore gets a short fixed pointer and the real prompt
+// travels on stdin, which agy's print mode reads — the prompt itself must
+// never reach argv (OPEND-3495, Windows `spawn ENAMETOOLONG`).
+test('antigravity runs print mode with a fixed -p pointer and the prompt on stdin', () => {
   assert.equal(antigravity.bin, 'agy');
   assert.equal(antigravity.streamFormat, 'plain');
-  assert.equal(antigravity.promptViaStdin, false);
+  assert.equal(antigravity.promptViaStdin, true);
 
   const args = antigravity.buildArgs('write hello world', [], [], {}, {});
-  assert.deepEqual(args, ['-p', 'write hello world']);
+  assert.deepEqual(args, ['-p', ANTIGRAVITY_STDIN_PROMPT_POINTER]);
 
   const argsWithLog = antigravity.buildArgs('write hello world', [], [], {}, {
     agentLogFilePath: '/tmp/od-agy-test.log',
@@ -668,7 +669,7 @@ test('antigravity passes prompt via -p argument (print mode)', () => {
     '--log-file',
     '/tmp/od-agy-test.log',
     '-p',
-    'write hello world',
+    ANTIGRAVITY_STDIN_PROMPT_POINTER,
   ]);
 
   // No `--model` flag exists upstream, so buildArgs argv must stay the
@@ -688,7 +689,7 @@ test('antigravity passes prompt via -p argument (print mode)', () => {
       '--log-file',
       '/tmp/od-agy-test.log',
       '-p',
-      'hi',
+      ANTIGRAVITY_STDIN_PROMPT_POINTER,
     ]);
   } finally {
     rmSync(settingsDir, { recursive: true, force: true });
@@ -705,13 +706,13 @@ test('antigravity passes prompt via -p argument (print mode)', () => {
   const followUp = antigravity.buildArgs('next message', [], [], {}, {
     hasPriorAssistantTurn: true,
   });
-  assert.deepEqual(followUp, ['-p', 'next message']);
+  assert.deepEqual(followUp, ['-p', ANTIGRAVITY_STDIN_PROMPT_POINTER]);
   assert.equal(followUp.includes('-c'), false);
 
   const firstTurn = antigravity.buildArgs('first', [], [], {}, {
     hasPriorAssistantTurn: false,
   });
-  assert.deepEqual(firstTurn, ['-p', 'first']);
+  assert.deepEqual(firstTurn, ['-p', ANTIGRAVITY_STDIN_PROMPT_POINTER]);
   assert.equal(antigravity.resumesSessionViaCli, undefined);
 
   assert.equal(antigravity.maxPromptArgBytes, undefined);
@@ -743,20 +744,44 @@ test('antigravity passes prompt via -p argument (print mode)', () => {
   assert.equal(antigravity.supportsCustomModel, false);
 });
 
+// OPEND-3495: on Windows the composed OD prompt (system prompt + skills +
+// design system + transcript) routinely exceeds CreateProcess's 32_767-char
+// command-line cap. Carrying it as the `-p` value made every such run die
+// with `spawn ENAMETOOLONG` before agy started. The prompt must travel on
+// stdin and argv must stay a small, prompt-independent size.
+test('antigravity delivers a large prompt on stdin, keeping argv under the Windows command-line cap', () => {
+  const marker = 'OPEND_3495_PROMPT_BODY_MARKER';
+  const prompt = `${'Design system rule line that pads the composed prompt.\n'.repeat(1800)}${marker}`;
+  assert.ok(prompt.length > 90_000);
+
+  const args = antigravity.buildArgs(prompt, [], [], {}, {
+    agentLogFilePath: 'C:\\Users\\me\\AppData\\Local\\Temp\\od-agy-run.log',
+  });
+  assert.equal(args.some((arg: string) => arg.includes(marker)), false);
+  const commandLineLength = ['C:\\Users\\me\\.local\\bin\\agy.exe', ...args]
+    .map((arg) => (/[\s"]/.test(arg) ? `"${arg.replace(/"/g, '\\"')}"` : arg))
+    .join(' ').length;
+  assert.ok(
+    commandLineLength < 32_767 - 1024,
+    `agy command line is ${commandLineLength} chars; Windows CreateProcess caps it at 32767`,
+  );
+  assert.equal(antigravity.promptViaStdin, true);
+});
+
 test('antigravity gates non-interactive permission bypass on the detected CLI capability', () => {
   agentCapabilities.delete('antigravity');
   assert.deepEqual(antigravity.helpArgs, ['--help']);
   assert.deepEqual(antigravity.capabilityFlags, {
     '--dangerously-skip-permissions': 'skipPermissions',
   });
-  assert.deepEqual(antigravity.buildArgs('', [], [], {}), ['-p', '']);
+  assert.deepEqual(antigravity.buildArgs('', [], [], {}), ['-p', ANTIGRAVITY_STDIN_PROMPT_POINTER]);
 
   agentCapabilities.set('antigravity', { skipPermissions: true });
   try {
     assert.deepEqual(antigravity.buildArgs('', [], [], {}), [
       '--dangerously-skip-permissions',
       '-p',
-      '',
+      ANTIGRAVITY_STDIN_PROMPT_POINTER,
     ]);
   } finally {
     agentCapabilities.delete('antigravity');
@@ -770,7 +795,7 @@ test('antigravity keeps log argv order when permission bypass is unavailable', (
       antigravity.buildArgs('', [], [], {}, {
         agentLogFilePath: '/tmp/od-agy-test.log',
       }),
-      ['--log-file', '/tmp/od-agy-test.log', '-p', ''],
+      ['--log-file', '/tmp/od-agy-test.log', '-p', ANTIGRAVITY_STDIN_PROMPT_POINTER],
     );
   } finally {
     agentCapabilities.delete('antigravity');
@@ -789,7 +814,7 @@ test('antigravity places permission bypass after log args', () => {
         '/tmp/od-agy-test.log',
         '--dangerously-skip-permissions',
         '-p',
-        '',
+        ANTIGRAVITY_STDIN_PROMPT_POINTER,
       ],
     );
   } finally {
